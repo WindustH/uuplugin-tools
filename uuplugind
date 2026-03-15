@@ -1,0 +1,127 @@
+#!/bin/zsh
+
+# ==========================================
+# UU Plugin Daemon for Steam Deck
+# ==========================================
+
+# --- 全局变量定义 ---
+# 获取脚本所在目录作为 BASEDIR
+readonly BASEDIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 从共享常量文件导入
+source "${BASEDIR}/uuplugin-constants.sh"
+
+# uuplugind 使用 DAEMON_LOG_FILE 作为日志文件
+readonly LOG_FILE="${DAEMON_LOG_FILE}"
+
+# --- 日志函数 ---
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+
+    # 只写入日志文件 (后台进程不应打扰控制台)
+    echo "[${timestamp}] [DAEMON] [${level}] ${message}" >> "${LOG_FILE}"
+}
+
+# --- 初始化 ---
+init_env() {
+    [ ! -d "${RUNNING_DIR}" ] && mkdir -p "${RUNNING_DIR}"
+
+    # 防止重复运行
+    if [ -f "$DAEMON_PID_FILE" ]; then
+        local pid=$(cat "$DAEMON_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "ERROR" "Daemon is already running with PID $pid."
+            exit 1
+        fi
+    fi
+    echo $$ > "$DAEMON_PID_FILE"
+}
+
+# --- 核心逻辑 ---
+
+# 检查插件进程是否存活
+is_plugin_running() {
+    if [ -f "$PLUGIN_PID_FILE" ]; then
+        local pid=$(cat "$PLUGIN_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 启动插件进程
+start_plugin() {
+    local exefile="${RUNNING_DIR}/${PLUGIN_EXE}"
+    local confile="${RUNNING_DIR}/${PLUGIN_CONF}"
+    local backtar="${PLUGIN_DIR}/${PLUGIN_TAR}"
+
+    # 检查执行文件
+    if [ ! -x "${exefile}" ]; then
+        if [ -f "${backtar}" ]; then
+            log "INFO" "Executable missing, extracting..."
+            tar zxvf "${backtar}" -C "${RUNNING_DIR}" >/dev/null 2>&1
+            chmod u+x "${exefile}"
+        else
+            log "ERROR" "No executable and no backup found. Please run 'uupluginctl update'."
+            return 1
+        fi
+    fi
+
+    # 启动
+    ${exefile} "${confile}" >/dev/null 2>&1 &
+    local pid=$!
+    echo $pid > "$PLUGIN_PID_FILE"
+
+    sleep 1
+    if kill -0 $pid 2>/dev/null; then
+        log "INFO" "uuplugin started (PID: $pid)."
+    else
+        log "ERROR" "uuplugin failed to start."
+    fi
+}
+
+# 清理函数
+cleanup() {
+    log "INFO" "Daemon stopping..."
+
+    # 停止插件进程
+    if is_plugin_running; then
+        local pid=$(cat "$PLUGIN_PID_FILE")
+        kill "$pid" 2>/dev/null
+        log "INFO" "Stopped uuplugin (PID: $pid)."
+    fi
+
+    rm -f "$PLUGIN_PID_FILE"
+    rm -f "$DAEMON_PID_FILE"
+    exit 0
+}
+
+# --- 主循环 ---
+main() {
+    init_env
+
+    # 捕获退出信号
+    trap cleanup SIGTERM SIGINT SIGHUP
+
+    log "INFO" "Daemon started (PID: $$)."
+
+    # 首次启动
+    if ! is_plugin_running; then
+        start_plugin
+    fi
+
+    # 监控循环
+    while true; do
+        if ! is_plugin_running; then
+            log "WARN" "uuplugin crashed or stopped. Restarting..."
+            start_plugin
+        fi
+        sleep 5
+    done
+}
+
+main

@@ -1,0 +1,226 @@
+#!/bin/zsh
+
+# ==========================================
+# UU Plugin Controller for Steam Deck
+# ==========================================
+
+# --- 全局变量定义 ---
+# 获取脚本所在目录作为 BASEDIR
+readonly BASEDIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 从共享常量文件导入
+source "${BASEDIR}/uuplugin-constants.sh"
+
+# uupluginctl 使用 CTL_LOG_FILE 作为日志文件
+readonly LOG_FILE="${CTL_LOG_FILE}"
+
+# --- 日志函数 ---
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+
+    # 输出到控制台
+    case $level in
+        INFO)  echo -e "${BLUE}[${timestamp}] [CTL] [INFO] ${message}${NC}" ;;
+        WARN)  echo -e "${YELLOW}[${timestamp}] [CTL] [WARN] ${message}${NC}" ;;
+        ERROR) echo -e "${RED}[${timestamp}] [CTL] [ERROR] ${message}${NC}" ;;
+        SUCCESS) echo -e "${GREEN}[${timestamp}] [CTL] [SUCCESS] ${message}${NC}" ;;
+    esac
+
+    # 输出到日志文件
+    echo "[${timestamp}] [CTL] [${level}] ${message}" >> "${LOG_FILE}"
+}
+
+log_info() { log "INFO" "$@"; }
+log_warn() { log "WARN" "$@"; }
+log_error() { log "ERROR" "$@"; exit 1; }
+log_success() { log "SUCCESS" "$@"; }
+
+# --- 辅助函数 ---
+
+is_daemon_running() {
+    if [ -f "$DAEMON_PID_FILE" ]; then
+        local pid=$(cat "$DAEMON_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_remote_info() {
+    local full_url="${URL_PREFIX}${DOWNLOAD_URL}${STEAM_DECK_PLUGIN}-${MODEL}"
+    curl -L -s -k -H "Accept:text/plain" "${full_url}" 2>/dev/null || \
+    wget -q --no-check-certificate -O - "${full_url}&output=text" 2>/dev/null
+}
+
+# --- 命令实现 ---
+
+do_start() {
+    if is_daemon_running; then
+        log_warn "Daemon is already running."
+        return 0
+    fi
+
+    if [ ! -x "$DAEMON_SCRIPT" ]; then
+        log_error "Daemon script not found or not executable: $DAEMON_SCRIPT"
+    fi
+
+    log_info "Starting uuplugind..."
+
+    # 启动守护进程
+    nohup "$DAEMON_SCRIPT" >/dev/null 2>&1 &
+
+    sleep 1
+    if is_daemon_running; then
+        log_success "Daemon started successfully."
+    else
+        log_error "Failed to start daemon. Check ${LOG_FILE} for details."
+    fi
+}
+
+do_stop() {
+    if ! is_daemon_running; then
+        log_warn "Daemon is not running."
+        return 0
+    fi
+
+    local pid=$(cat "$DAEMON_PID_FILE")
+    log_info "Stopping daemon (PID: $pid)..."
+
+    # 发送 TERM 信号，让 daemon 自己清理
+    kill "$pid" 2>/dev/null
+
+    # 等待进程退出
+    local count=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        count=$((count + 1))
+        if [ $count -gt 5 ]; then
+            kill -9 "$pid" 2>/dev/null
+            break
+        fi
+    done
+
+    # 确保清理 PID 文件
+    rm -f "$DAEMON_PID_FILE" "$PLUGIN_PID_FILE"
+    log_success "Daemon stopped."
+}
+
+do_update() {
+    log_info "Checking for updates..."
+
+    # 1. 获取远程信息
+    local remote_info=$(get_remote_info)
+    local remote_url=$(echo "$remote_info" | cut -d ',' -f 1)
+    local remote_md5=$(echo "$remote_info" | cut -d ',' -f 2)
+
+    if [ -z "$remote_url" ] || [ -z "$remote_md5" ]; then
+        log_error "Failed to fetch remote info."
+    fi
+
+    # 2. 比对 MD5
+    local local_md5=""
+    if [ -f "${PLUGIN_TAR_MD5_FILE}" ]; then
+        local_md5=$(cat "${PLUGIN_TAR_MD5_FILE}")
+    fi
+
+    log_info "Remote MD5: ${remote_md5}"
+    log_info "Local  MD5: ${local_md5:-None}"
+
+    if [ "$local_md5" = "$remote_md5" ] && [ -f "${PLUGIN_DIR}/${PLUGIN_TAR}" ]; then
+        log_success "Already up to date."
+        return 0
+    fi
+
+    log_info "New version found. Downloading..."
+
+    # 3. 下载
+    local tmp_tar="${RUNNING_DIR}/${PLUGIN_TAR}.tmp"
+    mkdir -p "${RUNNING_DIR}"
+
+    curl -L -s -k "$remote_url" -o "${tmp_tar}" >/dev/null 2>&1 || \
+    wget -q --no-check-certificate "$remote_url" -O "${tmp_tar}" >/dev/null 2>&1
+
+    if [ $? -ne 0 ]; then
+        rm -f "${tmp_tar}"
+        log_error "Download failed."
+    fi
+
+    # 4. 校验
+    local download_md5=$(md5sum "${tmp_tar}" | awk '{print $1}')
+    if [ "$download_md5" != "$remote_md5" ]; then
+        rm -f "${tmp_tar}"
+        log_error "MD5 mismatch."
+    fi
+
+    # 5. 解压与安装
+    log_info "Extracting..."
+    tar zxvf "${tmp_tar}" -C "${RUNNING_DIR}" >/dev/null 2>&1
+    chmod u+x "${RUNNING_DIR}/uuplugin"
+
+    # 备份
+    cp "${tmp_tar}" "${PLUGIN_DIR}/${PLUGIN_TAR}"
+    echo "${remote_md5}" > "${PLUGIN_TAR_MD5_FILE}"
+    rm "${tmp_tar}"
+
+    log_success "Update installed."
+
+    # 6. 热重载 (如果正在运行)
+    if is_daemon_running; then
+        log_info "Restarting service to apply update..."
+        # 只要杀掉插件进程，Daemon 监控循环会发现并重启它
+        local plugin_pid=$(cat "$PLUGIN_PID_FILE" 2>/dev/null)
+        if [ -n "$plugin_pid" ]; then
+             kill "$plugin_pid" 2>/dev/null
+             log_info "Triggered plugin restart."
+        fi
+    fi
+}
+
+do_status() {
+    if is_daemon_running; then
+        local d_pid=$(cat "$DAEMON_PID_FILE")
+        echo -e "${GREEN}Daemon Status: Running (PID: $d_pid)${NC}"
+
+        if [ -f "$PLUGIN_PID_FILE" ]; then
+            local p_pid=$(cat "$PLUGIN_PID_FILE")
+            if kill -0 "$p_pid" 2>/dev/null; then
+                echo -e "${GREEN}Plugin Status:  Running (PID: $p_pid)${NC}"
+            else
+                echo -e "${RED}Plugin Status:  Dead (Stale PID file)${NC}"
+            fi
+        else
+            echo -e "${YELLOW}Plugin Status:  Stopped${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Daemon Status: Stopped${NC}"
+    fi
+}
+
+# --- 主入口 ---
+case "$1" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    update)
+        do_update
+        ;;
+    status)
+        do_status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|update|status}"
+        echo ""
+        echo "  start   - Start the background daemon."
+        echo "  stop    - Stop the background daemon."
+        echo "  update  - Check and install updates."
+        echo "  status  - Check service status."
+        exit 1
+        ;;
+esac
