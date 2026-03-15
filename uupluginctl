@@ -1,7 +1,7 @@
 #!/bin/zsh
 
 # ==========================================
-# UU Plugin Controller for Steam Deck
+# UU Plugin Controller for Arch Linux x86
 # ==========================================
 
 # --- 全局变量定义 ---
@@ -57,57 +57,6 @@ get_remote_info() {
 }
 
 # --- 命令实现 ---
-
-do_start() {
-    if is_daemon_running; then
-        log_warn "Daemon is already running."
-        return 0
-    fi
-
-    if [ ! -x "$DAEMON_SCRIPT" ]; then
-        log_error "Daemon script not found or not executable: $DAEMON_SCRIPT"
-    fi
-
-    log_info "Starting uuplugind..."
-
-    # 启动守护进程
-    nohup "$DAEMON_SCRIPT" >/dev/null 2>&1 &
-
-    sleep 1
-    if is_daemon_running; then
-        log_success "Daemon started successfully."
-    else
-        log_error "Failed to start daemon. Check ${LOG_FILE} for details."
-    fi
-}
-
-do_stop() {
-    if ! is_daemon_running; then
-        log_warn "Daemon is not running."
-        return 0
-    fi
-
-    local pid=$(cat "$DAEMON_PID_FILE")
-    log_info "Stopping daemon (PID: $pid)..."
-
-    # 发送 TERM 信号，让 daemon 自己清理
-    kill "$pid" 2>/dev/null
-
-    # 等待进程退出
-    local count=0
-    while kill -0 "$pid" 2>/dev/null; do
-        sleep 1
-        count=$((count + 1))
-        if [ $count -gt 5 ]; then
-            kill -9 "$pid" 2>/dev/null
-            break
-        fi
-    done
-
-    # 确保清理 PID 文件
-    rm -f "$DAEMON_PID_FILE" "$PLUGIN_PID_FILE"
-    log_success "Daemon stopped."
-}
 
 do_update() {
     log_info "Checking for updates..."
@@ -202,12 +151,6 @@ do_status() {
 
 # --- 主入口 ---
 case "$1" in
-    start)
-        do_start
-        ;;
-    stop)
-        do_stop
-        ;;
     update)
         do_update
         ;;
@@ -215,12 +158,13 @@ case "$1" in
         do_status
         ;;
     *)
-        echo "Usage: $0 {start|stop|update|status}"
+        echo "Usage: $0 {update|status}"
         echo ""
-        echo "  start   - Start the background daemon."
-        echo "  stop    - Stop the background daemon."
         echo "  update  - Check and install updates."
         echo "  status  - Check service status."
+        echo ""
+        echo "Note: Starting and stopping should be managed via systemd service."
+        echo "      uuplugind requires root privileges to run properly."
         exit 1
         ;;
 esac
