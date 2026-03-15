@@ -1,6 +1,6 @@
-# UU Plugin for Steam Deck
+# UU Plugin for Arch Linux x86
 
-这是一个用于在 Steam Deck 上运行 UU 加速器插件的工具集。
+这是一个用于在 Arch Linux x86 上运行 UU 加速器插件的工具集。
 
 ## 文件说明
 
